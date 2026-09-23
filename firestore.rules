@@ -1,0 +1,113 @@
+rules_version = '2';
+
+// Cloud Firestore security rules for Smart ToDo.
+//
+// Ownership is enforced here, on the server, and never by the UI. The client
+// derives the user id from the authenticated Firebase user, but a client can be
+// modified — these rules are what actually stops one signed-in user from
+// reading or writing another user's data.
+//
+// Deploy with:  firebase deploy --only firestore:rules
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ---------------------------------------------------------------- helpers
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    // The only condition under which a user's subtree is reachable: the request
+    // is authenticated AND the uid in the path is the caller's own.
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    // Shape of a task document, as written by lib/data/models/task_model.dart.
+    // Optional fields are written explicitly as null, so they are present and
+    // checked for the right type rather than merely absent.
+    function isValidTask(data) {
+      return data.keys().hasOnly([
+            'userId',
+            'title',
+            'description',
+            'isCompleted',
+            'priority',
+            'dueDate',
+            'createdAt',
+            'updatedAt',
+            'completedAt'
+          ])
+        // Ownership is data, not just a path: a task may not claim another user.
+        && data.userId is string
+        && data.userId == request.auth.uid
+        && data.title is string
+        && data.title.size() > 0
+        && data.title.size() <= 100
+        && (data.description == null || data.description is string)
+        && (data.description == null || data.description.size() <= 500)
+        && data.isCompleted is bool
+        && data.priority is string
+        && data.priority in ['low', 'medium', 'high']
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp
+        && (data.dueDate == null || data.dueDate is timestamp)
+        && (data.completedAt == null || data.completedAt is timestamp);
+    }
+
+    // Shape of the users/{uid} profile document written by AuthService.
+    function isValidProfile(data) {
+      return data.keys()
+            .hasOnly(['uid', 'displayName', 'email', 'createdAt', 'updatedAt'])
+        && data.uid is string
+        && data.uid == request.auth.uid
+        && data.displayName is string
+        && data.displayName.size() > 0
+        && data.displayName.size() <= 60
+        && data.email is string
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    // ----------------------------------------------------------------- owners
+
+    match /users/{userId} {
+      // Only the owner can read their profile.
+      allow read: if isOwner(userId);
+
+      allow create: if isOwner(userId) && isValidProfile(request.resource.data);
+
+      // `uid` is immutable: an update may not re-point a profile at another
+      // account.
+      allow update: if isOwner(userId)
+                    && isValidProfile(request.resource.data)
+                    && request.resource.data.uid == resource.data.uid
+                    && request.resource.data.createdAt == resource.data.createdAt;
+
+      // Account deletion is not offered by the app. Denying it here means a
+      // modified client cannot orphan a profile either.
+      allow delete: if false;
+
+      match /tasks/{taskId} {
+        allow read: if isOwner(userId);
+
+        allow create: if isOwner(userId) && isValidTask(request.resource.data);
+
+        allow update: if isOwner(userId)
+                      && isValidTask(request.resource.data)
+                      // Ownership and creation time cannot be changed by an
+                      // update, so a task cannot be reassigned or backdated.
+                      && request.resource.data.userId == resource.data.userId
+                      && request.resource.data.createdAt == resource.data.createdAt;
+
+        allow delete: if isOwner(userId);
+      }
+    }
+
+    // Everything not matched above is denied. Without this, a future collection
+    // added to the client would be silently world-readable in test mode.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
